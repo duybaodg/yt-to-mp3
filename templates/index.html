@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Convert YouTube videos and playlists to MP3 audio.">
+    <title>Tunecast — YouTube to MP3</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+</head>
+<body>
+    <nav class="topbar" aria-label="Primary navigation">
+        <a class="brand" href="/" aria-label="Tunecast home">TUNE<span>CAST</span></a>
+        <a class="help-link" href="https://github.com/yt-dlp/yt-dlp#usage-and-options" target="_blank" rel="noopener" aria-label="Help"><i class="ph-bold ph-question" aria-hidden="true"></i></a>
+    </nav>
+    <main class="app-shell">
+        <section class="intro" aria-labelledby="page-title">
+            <h1 id="page-title">Turn YouTube<br>into audio.</h1>
+            <div class="intro-copy"><span class="accent-line" aria-hidden="true"></span><p>Paste a video or playlist link.<br>We’ll handle the rest.</p></div>
+        </section>
+        <section class="workspace" aria-label="YouTube audio converter">
+            <div class="waveform" aria-hidden="true">
+                <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <form id="convert-form" class="convert-form">
+                <label for="youtube-url">YouTube URL</label>
+                <div class="input-group">
+                    <i class="ph ph-link input-icon" aria-hidden="true"></i>
+                    <input type="url" id="youtube-url" placeholder="https://youtube.com/watch?v=…" required autocomplete="off" aria-describedby="format-note">
+                </div>
+                <button type="submit" id="submit-btn" class="btn-primary">
+                    <span class="btn-text">Convert to MP3</span><i class="ph-bold ph-arrow-right btn-icon" aria-hidden="true"></i><i class="ph-bold ph-spinner-gap btn-loader spinner" aria-hidden="true"></i>
+                </button>
+            </form>
+            <p id="format-note" class="format-note"><i class="ph ph-info" aria-hidden="true"></i> 192 kbps MP3 · Single videos &amp; playlists</p>
+            <div id="status-message" class="status-message hidden" role="status" aria-live="polite"></div>
+            <div id="playlist-panel" class="playlist-panel hidden">
+                <div class="playlist-header"><i class="ph-bold ph-playlist" aria-hidden="true"></i><div class="playlist-info"><h2 id="playlist-title">Playlist</h2><span id="playlist-count">0 tracks</span></div></div>
+                <ul id="playlist-tracks" class="playlist-tracks" aria-label="Playlist tracks"></ul>
+            </div>
+        </section>
+    </main>
+    <footer>Built for personal listening.</footer>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>

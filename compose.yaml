@@ -1,0 +1,28 @@
+services:
+  app:
+    build: .
+    ports:
+      - '3000:3000'
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      WEB_CONCURRENCY: 2
+    depends_on:
+      redis:
+        condition: service_healthy
+    cpus: 2
+    mem_limit: 1g
+    pids_limit: 100
+    tmpfs:
+      - /app/downloads:size=512m,uid=1000,gid=1000
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: redis-server --save '' --appendonly no --maxmemory 64mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    mem_limit: 96m
+    restart: unless-stopped

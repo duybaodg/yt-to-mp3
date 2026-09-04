@@ -1,0 +1,12 @@
+.agent
+.git
+.idea
+.pytest_cache
+__pycache__
+docs
+downloads
+tests
+venv
+*.mp3
+*.pyc
+*.zip
