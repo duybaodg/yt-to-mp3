@@ -16,8 +16,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
           cache: pip
@@ -38,18 +38,18 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@v6
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
           tags: type=raw,value=latest
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         id: build
         with:
           context: .
@@ -71,7 +71,7 @@ jobs:
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       APP_IMAGE: ${{ needs.publish.outputs.image }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Configure SSH
         env:
           SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
@@ -85,13 +85,12 @@ jobs:
         run: |
           ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" 'mkdir -p /opt/yt-convert'
           scp -o BatchMode=yes compose.yaml "$DEPLOY_USER@$DEPLOY_HOST:/opt/yt-convert/compose.yaml"
-          ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" "bash -se" <<EOF
+          ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" "APP_IMAGE='$APP_IMAGE' bash -se" <<'EOF'
           cd /opt/yt-convert
-          export APP_IMAGE='$APP_IMAGE'
           docker compose pull
           docker compose up --no-build --wait --wait-timeout 120
           curl --fail --silent --show-error http://127.0.0.1:3000/ >/dev/null
-          printf 'APP_IMAGE=%s\n' '$APP_IMAGE' > .env
+          printf 'APP_IMAGE=%s\n' "$APP_IMAGE" > .env
           EOF
       - name: Remove SSH credentials
         if: always()
