@@ -10,8 +10,12 @@ import yt_dlp
 from flask import Flask, after_this_request, jsonify, render_template, request, send_file
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+if os.environ.get('TRUST_PROXY') == '1':
+    # Enable only behind the single Nginx proxy; keep port 3000 private.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 limiter = Limiter(
     key_func=get_remote_address,
     app=app,

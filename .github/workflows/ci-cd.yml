@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -19,11 +23,17 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt pytest
       - run: pytest -v
+      - run: docker compose up --build --wait --wait-timeout 120
+      - run: curl --fail http://127.0.0.1:3000/
+      - if: always()
+        run: docker compose logs && docker compose down
 
   publish:
     if: github.event_name == 'push'
     needs: test
     runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
     permissions:
       contents: read
       packages: write
@@ -40,8 +50,49 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: type=raw,value=latest
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+      - id: image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY,,}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      APP_IMAGE: ${{ needs.publish.outputs.image }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+      - name: Deploy published image
+        run: |
+          ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" 'mkdir -p /opt/yt-convert'
+          scp -o BatchMode=yes compose.yaml "$DEPLOY_USER@$DEPLOY_HOST:/opt/yt-convert/compose.yaml"
+          ssh -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" "bash -se" <<EOF
+          cd /opt/yt-convert
+          export APP_IMAGE='$APP_IMAGE'
+          docker compose pull
+          docker compose up --no-build --wait --wait-timeout 120
+          curl --fail --silent --show-error http://127.0.0.1:3000/ >/dev/null
+          printf 'APP_IMAGE=%s\n' '$APP_IMAGE' > .env
+          EOF
+      - name: Remove SSH credentials
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519

@@ -3,9 +3,36 @@ Security tests for the YouTube MP3 Converter Flask app.
 Run with: pytest tests/test_security.py -v
 """
 import json
+import os
+import subprocess
+import sys
 import pytest
 
 from app import app as flask_app
+
+
+class TestProxyConfiguration:
+    @pytest.mark.parametrize('enabled', ['0', '1'])
+    def test_forwarded_client_ip_requires_proxy_opt_in(self, enabled):
+        subprocess.run([sys.executable, '-c', '''
+import os
+from flask import request
+from flask_limiter.util import get_remote_address
+from app import app
+
+@app.route('/proxy-check')
+def proxy_check():
+    return {'ip': get_remote_address(), 'scheme': request.scheme}
+
+response = app.test_client().get('/proxy-check', headers={
+    'X-Forwarded-For': '198.51.100.99, 203.0.113.10',
+    'X-Forwarded-Proto': 'https',
+})
+expected = ({'ip': '203.0.113.10', 'scheme': 'https'}
+            if os.environ['TRUST_PROXY'] == '1'
+            else {'ip': '127.0.0.1', 'scheme': 'http'})
+assert response.get_json() == expected
+'''], env={**os.environ, 'TRUST_PROXY': enabled, 'REDIS_URL': 'memory://'}, check=True)
 
 
 @pytest.fixture()
