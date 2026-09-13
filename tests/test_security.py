@@ -6,9 +6,14 @@ import json
 import os
 import subprocess
 import sys
+import time
+from pathlib import Path
+
 import pytest
 
-from app import app as flask_app
+import app as app_module
+
+flask_app = app_module.app
 
 
 class TestProxyConfiguration:
@@ -38,10 +43,12 @@ assert response.get_json() == expected
 @pytest.fixture()
 def client():
     flask_app.config['TESTING'] = True
-    # Disable rate limiting during tests (each test gets fresh state anyway)
-    flask_app.config['RATELIMIT_ENABLED'] = False
-    with flask_app.test_client() as c:
-        yield c
+    app_module.limiter.enabled = False
+    try:
+        with flask_app.test_client() as c:
+            yield c
+    finally:
+        app_module.limiter.enabled = True
 
 
 # ── Security Headers ────────────────────────────────────────────────────────────
@@ -162,4 +169,126 @@ class TestRequestSizeLimit:
         assert r.status_code == 413
 
 
-# ── Payload Size Limit ─────────────────────────────────────────────────────────
+# ── Download Resource Limits ───────────────────────────────────────────────────
+
+class TestDownloadResourceLimits:
+    @staticmethod
+    def _prepare(client, monkeypatch, tmp_path, fake_ydl):
+        monkeypatch.setattr(app_module, 'DOWNLOAD_FOLDER', str(tmp_path))
+        monkeypatch.setattr(app_module, 'is_safe_url', lambda url: True)
+        monkeypatch.setattr(app_module.yt_dlp, 'YoutubeDL', fake_ydl)
+        return client.post(
+            '/convert',
+            json={'url': 'https://youtube.com/watch?v=dQw4w9WgXcQ'},
+        )
+
+    def test_oversized_download_is_rejected_and_cleaned(
+        self, client, monkeypatch, tmp_path
+    ):
+        class OversizedDownload:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def extract_info(self, url, download):
+                partial = self.options['outtmpl'].replace('%(ext)s', 'webm.part')
+                Path(partial).write_bytes(b'partial download')
+                self.options['progress_hooks'][0]({
+                    'downloaded_bytes': app_module.MAX_DOWNLOAD_BYTES + 1,
+                })
+
+        response = self._prepare(client, monkeypatch, tmp_path, OversizedDownload)
+
+        assert response.status_code == 422
+        assert str(app_module.MAX_DOWNLOAD_MB) in response.get_json()['error']
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize('info', [
+        {'is_live': True},
+        {'duration': app_module.MAX_DURATION_SECONDS + 1},
+    ])
+    def test_live_and_overlong_media_are_rejected(self, info):
+        with pytest.raises(app_module.MediaLimitError):
+            app_module._enforce_media_limits(info)
+
+    def test_normal_download_still_succeeds_and_is_cleaned(
+        self, client, monkeypatch, tmp_path
+    ):
+        class NormalDownload:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def extract_info(self, url, download):
+                assert self.options['max_filesize'] == app_module.MAX_DOWNLOAD_BYTES
+                assert self.options['match_filter']({'duration': 60}) is None
+                output = self.options['outtmpl'].replace('%(ext)s', 'mp3')
+                Path(output).write_bytes(b'mp3 data')
+                return {'title': 'Test audio'}
+
+        response = self._prepare(client, monkeypatch, tmp_path, NormalDownload)
+
+        assert response.status_code == 200
+        assert response.data == b'mp3 data'
+        assert list(tmp_path.iterdir()) == []
+
+    def test_stale_cleanup_keeps_active_files(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(app_module, 'DOWNLOAD_FOLDER', str(tmp_path))
+        stale = tmp_path / '00000000-0000-0000-0000-000000000001.webm.part'
+        active = tmp_path / '00000000-0000-0000-0000-000000000002.webm.part'
+        unrelated = tmp_path / '.DS_Store'
+        stale.write_bytes(b'x')
+        active.write_bytes(b'x')
+        unrelated.write_bytes(b'x')
+        expired = time.time() - app_module.STALE_DOWNLOAD_SECONDS - 1
+        os.utime(stale, (expired, expired))
+        os.utime(unrelated, (expired, expired))
+
+        app_module._cleanup_stale_downloads()
+
+        assert not stale.exists()
+        assert active.exists()
+        assert unrelated.exists()
+
+
+class TestRateLimits:
+    def test_failed_expensive_requests_consume_quota(self):
+        subprocess.run([sys.executable, '-c', '''
+import yt_dlp
+import app as module
+
+class FailingDownload:
+    def __init__(self, options):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def extract_info(self, url, download):
+        raise yt_dlp.utils.DownloadError('unavailable')
+
+module.is_safe_url = lambda url: True
+module.yt_dlp.YoutubeDL = FailingDownload
+client = module.app.test_client()
+url = {'url': 'https://youtube.com/watch?v=dQw4w9WgXcQ'}
+
+assert [client.post('/convert', json=url).status_code for _ in range(6)] == [
+    422, 422, 422, 422, 422, 429,
+]
+assert [client.post('/playlist/info', json=url).status_code for _ in range(11)] == [
+    422, 422, 422, 422, 422, 422, 422, 422, 422, 422, 429,
+]
+'''], env={**os.environ, 'TRUST_PROXY': '0', 'REDIS_URL': 'memory://'}, check=True)

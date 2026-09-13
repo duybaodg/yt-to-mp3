@@ -1,8 +1,10 @@
+import glob
 import ipaddress
 import os
 import re
 import shutil
 import socket
+import time
 import uuid
 from urllib.parse import urlparse
 
@@ -26,6 +28,11 @@ limiter = Limiter(
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024  # 2 KB max body — a URL is < 200 bytes
 
 DOWNLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'downloads')
+MAX_DOWNLOAD_MB = int(os.environ.get('MAX_DOWNLOAD_MB', '100'))
+MAX_DOWNLOAD_BYTES = MAX_DOWNLOAD_MB * 1024 * 1024
+MAX_DURATION_MINUTES = int(os.environ.get('MAX_DURATION_MINUTES', '90'))
+MAX_DURATION_SECONDS = MAX_DURATION_MINUTES * 60
+STALE_DOWNLOAD_SECONDS = int(os.environ.get('STALE_DOWNLOAD_MINUTES', '10')) * 60
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 # ── Startup check: ffmpeg ──────────────────────────────────────────────────────
@@ -53,6 +60,10 @@ _PLAYLIST_URL_RE = re.compile(
 )
 
 _YOUTUBE_HOSTS = {'youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be'}
+_JOB_FILE_RE = re.compile(
+    r'^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.',
+    re.IGNORECASE,
+)
 
 # Private / loopback IP ranges — blocked to prevent SSRF
 _PRIVATE_NETWORKS = [
@@ -64,6 +75,50 @@ _PRIVATE_NETWORKS = [
     ipaddress.ip_network('::1/128'),           # IPv6 loopback
     ipaddress.ip_network('fc00::/7'),          # IPv6 private
 ]
+
+
+class MediaLimitError(Exception):
+    """Raised when remote media exceeds this service's resource budget."""
+
+
+def _enforce_media_limits(info, *, incomplete=False):
+    if info.get('is_live') or info.get('live_status') in {'is_live', 'is_upcoming'}:
+        raise MediaLimitError('Live streams cannot be converted.')
+    if info.get('duration') and info['duration'] > MAX_DURATION_SECONDS:
+        raise MediaLimitError(
+            f'Videos longer than {MAX_DURATION_MINUTES} minutes cannot be converted.'
+        )
+
+
+def _enforce_download_limit(status):
+    if (status.get('downloaded_bytes') or 0) > MAX_DOWNLOAD_BYTES:
+        raise MediaLimitError(
+            f'The selected audio exceeds the {MAX_DOWNLOAD_MB} MB download limit.'
+        )
+
+
+def _cleanup_job(job_id):
+    for path in glob.glob(os.path.join(DOWNLOAD_FOLDER, f'{job_id}.*')):
+        try:
+            os.remove(path)
+        except OSError as exc:
+            app.logger.error('Error removing temp file %s: %s', path, exc)
+
+
+def _cleanup_stale_downloads():
+    # ponytail: mtime cleanup assumes stuck workers die within Gunicorn's
+    # five-minute timeout; use a job queue if conversions may outlive it.
+    cutoff = time.time() - STALE_DOWNLOAD_SECONDS
+    for entry in os.scandir(DOWNLOAD_FOLDER):
+        try:
+            if (
+                _JOB_FILE_RE.match(entry.name)
+                and entry.is_file()
+                and entry.stat().st_mtime < cutoff
+            ):
+                os.remove(entry.path)
+        except OSError as exc:
+            app.logger.error('Error removing stale temp file %s: %s', entry.path, exc)
 
 
 def is_valid_youtube_url(url: str) -> bool:
@@ -176,7 +231,7 @@ def _base_ydl_opts():
 
 
 @app.route('/playlist/info', methods=['POST'])
-@limiter.limit('10 per minute', deduct_when=lambda response: response.status_code < 400)
+@limiter.limit('10 per minute')
 def playlist_info():
     """Scan a YouTube URL and return playlist info if it's a playlist,
     or single-video info if it's a regular video."""
@@ -236,7 +291,7 @@ def playlist_info():
 
 
 @app.route('/convert', methods=['POST'])
-@limiter.limit('5 per minute', deduct_when=lambda response: response.status_code < 400)
+@limiter.limit('5 per minute')
 def convert():
     """Download a single YouTube video as MP3."""
     data = request.get_json(silent=True)
@@ -253,14 +308,23 @@ def convert():
     if not is_safe_url(url):
         return jsonify({'error': 'Please provide a valid YouTube URL.'}), 400
 
+    _cleanup_stale_downloads()
     job_id = str(uuid.uuid4())
     output_template = os.path.join(DOWNLOAD_FOLDER, f'{job_id}.%(ext)s')
     output_file = os.path.join(DOWNLOAD_FOLDER, f'{job_id}.mp3')
 
+    @after_this_request
+    def remove_files(response):
+        _cleanup_job(job_id)
+        return response
+
     ydl_opts = _base_ydl_opts()
     ydl_opts.update({
         'format': 'bestaudio/best',
+        'match_filter': _enforce_media_limits,
+        'max_filesize': MAX_DOWNLOAD_BYTES,
         'outtmpl': output_template,
+        'progress_hooks': [_enforce_download_limit],
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -275,16 +339,12 @@ def convert():
             title = info.get('title', 'audio') if info else 'audio'
 
         if not os.path.exists(output_file):
-            return jsonify({'error': 'Failed to convert video to MP3. Ensure ffmpeg is installed.'}), 500
-
-        @after_this_request
-        def remove_file(response):
-            try:
-                if os.path.exists(output_file):
-                    os.remove(output_file)
-            except Exception as err:
-                app.logger.error('Error removing temp file %s: %s', output_file, err)
-            return response
+            return jsonify({
+                'error': (
+                    'The audio is unavailable or exceeds the '
+                    f'{MAX_DOWNLOAD_MB} MB download limit.'
+                )
+            }), 422
 
         safe_title = re.sub(r'[^\w\s\-]', '', title, flags=re.UNICODE).strip()
         download_name = f'{safe_title}.mp3' if safe_title else 'audio.mp3'
@@ -296,16 +356,15 @@ def convert():
             mimetype='audio/mpeg',
         )
 
+    except MediaLimitError as exc:
+        return jsonify({'error': str(exc)}), 422
+
     except yt_dlp.utils.DownloadError as exc:
         app.logger.error('yt-dlp DownloadError: %s', exc)
-        if os.path.exists(output_file):
-            os.remove(output_file)
         return jsonify({'error': friendly_error(exc)}), 422
 
     except Exception as exc:
         app.logger.error('Unexpected error during conversion: %s', exc)
-        if os.path.exists(output_file):
-            os.remove(output_file)
         return jsonify({'error': 'An unexpected error occurred. Please try again.'}), 500
 
 

@@ -104,9 +104,12 @@ printf 'APP_IMAGE=%s\n' "$APP_IMAGE" > .env
 Use lowercase owner/repository names. Deployments briefly interrupt service and
 can interrupt active conversions; failed health checks fail the workflow but do
 not automatically roll back. Downloads use a 512 MB temporary filesystem, and the
-app has a 1 GB memory limit and a 300-second worker timeout. Redis counters reset
-when Redis restarts. A healthy homepage verifies startup, not live YouTube access;
-test a conversion after deployment because datacenter IPs may be challenged.
+app has a 1 GB memory limit and a 300-second worker timeout. Each conversion is
+limited to 100 MB of selected audio and 90 minutes; abandoned download files are
+removed after 10 minutes. Keep these limits aligned with `WEB_CONCURRENCY` and the
+downloads tmpfs size. Redis counters reset when Redis restarts. A healthy homepage
+verifies startup, not live YouTube access; test a conversion after deployment
+because datacenter IPs may be challenged.
 
 Client-IP handling follows Flask's [trusted proxy guidance](https://flask.palletsprojects.com/en/stable/deploying/proxy_fix/).
 Compose readiness uses [`up --wait`](https://docs.docker.com/reference/cli/docker/compose/up/).
