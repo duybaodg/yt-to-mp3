@@ -22,7 +22,7 @@ jobs:
           python-version: '3.13'
           cache: pip
       - run: pip install -r requirements.txt pytest
-      - run: pytest -v
+      - run: python -m pytest -v
       - run: docker compose up --build --wait --wait-timeout 120
       - run: curl --fail http://127.0.0.1:3000/
       - if: always()
