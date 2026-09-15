@@ -28,7 +28,18 @@ services:
     build: .
     command: rq worker --url redis://redis:6379/0 conversions
     healthcheck:
-      disable: true
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os; from redis import Redis; from rq import Worker;
+          workers = Worker.all(connection=Redis.from_url(os.environ['REDIS_URL']));
+          assert any(worker.hostname == os.uname().nodename and worker.get_state() in ('idle', 'busy') for worker in workers)
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
     environment:
       REDIS_URL: redis://redis:6379/0
       MAX_DOWNLOAD_MB: 100
