@@ -126,6 +126,10 @@ class TestInputValidation:
         r = client.post('/playlist/info', json={'url': 'https://example.com/video'})
         assert r.status_code == 400
 
+    @pytest.mark.parametrize('endpoint', ['/convert', '/playlist/info'])
+    def test_json_body_must_be_an_object(self, client, endpoint):
+        assert client.post(endpoint, json=['url']).status_code == 400
+
 
 # ── SSRF Protection ─────────────────────────────────────────────────────────────
 
@@ -177,9 +181,10 @@ class TestDownloadResourceLimits:
         monkeypatch.setattr(app_module, 'DOWNLOAD_FOLDER', str(tmp_path))
         monkeypatch.setattr(app_module, 'is_safe_url', lambda url: True)
         monkeypatch.setattr(app_module.yt_dlp, 'YoutubeDL', fake_ydl)
-        return client.post(
-            '/convert',
-            json={'url': 'https://youtube.com/watch?v=dQw4w9WgXcQ'},
+        monkeypatch.setattr(app_module, '_release_job_slot', lambda job_id: None)
+        return app_module._conversion_job(
+            'https://youtube.com/watch?v=dQw4w9WgXcQ',
+            '00000000-0000-0000-0000-000000000001',
         )
 
     def test_oversized_download_is_rejected_and_cleaned(
@@ -202,10 +207,10 @@ class TestDownloadResourceLimits:
                     'downloaded_bytes': app_module.MAX_DOWNLOAD_BYTES + 1,
                 })
 
-        response = self._prepare(client, monkeypatch, tmp_path, OversizedDownload)
+        result = self._prepare(client, monkeypatch, tmp_path, OversizedDownload)
 
-        assert response.status_code == 422
-        assert str(app_module.MAX_DOWNLOAD_MB) in response.get_json()['error']
+        assert result['status'] == 'failed'
+        assert str(app_module.MAX_DOWNLOAD_MB) in result['error']
         assert list(tmp_path.iterdir()) == []
 
     @pytest.mark.parametrize('info', [
@@ -236,10 +241,35 @@ class TestDownloadResourceLimits:
                 Path(output).write_bytes(b'mp3 data')
                 return {'title': 'Test audio'}
 
-        response = self._prepare(client, monkeypatch, tmp_path, NormalDownload)
+        result = self._prepare(client, monkeypatch, tmp_path, NormalDownload)
 
-        assert response.status_code == 200
-        assert response.data == b'mp3 data'
+        assert result == {
+            'status': 'ready',
+            'type': 'conversion',
+            'download_name': 'Test audio.mp3',
+        }
+        assert [path.read_bytes() for path in tmp_path.iterdir()] == [b'mp3 data']
+
+    def test_final_mp3_size_is_enforced(self, client, monkeypatch, tmp_path):
+        class LargeOutput:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def extract_info(self, url, download):
+                output = self.options['outtmpl'].replace('%(ext)s', 'mp3')
+                Path(output).write_bytes(b'123456')
+                return {'title': 'Too large'}
+
+        monkeypatch.setattr(app_module, 'MAX_DOWNLOAD_BYTES', 5)
+        result = self._prepare(client, monkeypatch, tmp_path, LargeOutput)
+
+        assert result['status'] == 'failed'
         assert list(tmp_path.iterdir()) == []
 
     def test_stale_cleanup_keeps_active_files(self, monkeypatch, tmp_path):
@@ -261,34 +291,161 @@ class TestDownloadResourceLimits:
         assert unrelated.exists()
 
 
+class TestJobAPI:
+    job_id = '00000000-0000-0000-0000-000000000001'
+    url = 'https://youtube.com/watch?v=dQw4w9WgXcQ'
+
+    def test_expensive_request_is_queued_without_running_ytdlp(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setattr(app_module, 'is_safe_url', lambda url: True)
+        monkeypatch.setattr(app_module, '_cleanup_stale_downloads', lambda: None)
+        monkeypatch.setattr(
+            app_module, '_enqueue_job', lambda function, url: self.job_id
+        )
+
+        response = client.post('/convert', json={'url': self.url})
+
+        assert response.status_code == 202
+        assert response.get_json() == {
+            'expires_in': app_module.JOB_SLOT_SECONDS,
+            'job_id': self.job_id,
+            'status': 'queued',
+            'status_url': f'/jobs/{self.job_id}',
+        }
+
+    def test_full_queue_fails_fast(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, 'is_safe_url', lambda url: True)
+        monkeypatch.setattr(app_module, '_cleanup_stale_downloads', lambda: None)
+        monkeypatch.setattr(app_module, '_enqueue_job', lambda function, url: None)
+
+        response = client.post('/convert', json={'url': self.url})
+
+        assert response.status_code == 503
+        assert response.headers['Retry-After'] == '10'
+
+    def test_queue_ttl_covers_every_admitted_job(self, monkeypatch):
+        captured = {}
+
+        class FakeQueue:
+            @staticmethod
+            def enqueue(*args, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr(app_module, '_reserve_job_slot', lambda job_id: True)
+        monkeypatch.setattr(app_module, '_conversion_queue', FakeQueue)
+
+        app_module._enqueue_job(app_module._conversion_job, self.url)
+
+        assert captured['ttl'] == (
+            app_module.MAX_ACTIVE_JOBS * app_module.JOB_TIMEOUT_SECONDS
+        )
+        assert captured['result_ttl'] == app_module.STALE_DOWNLOAD_SECONDS
+
+    def test_finished_job_exposes_download_url(self, client, monkeypatch):
+        class FinishedJob:
+            result = {
+                'status': 'ready',
+                'type': 'conversion',
+                'download_name': 'Test.mp3',
+            }
+
+            @staticmethod
+            def get_status(refresh):
+                return 'finished'
+
+        monkeypatch.setattr(
+            app_module.Job, 'fetch', lambda *args, **kwargs: FinishedJob()
+        )
+        monkeypatch.setattr(app_module, '_redis_connection', lambda: object())
+
+        response = client.get(f'/jobs/{self.job_id}')
+
+        assert response.status_code == 200
+        assert response.get_json()['download_url'] == f'/downloads/{self.job_id}'
+
+    def test_download_is_served_once_and_cleaned(
+        self, client, monkeypatch, tmp_path
+    ):
+        class FinishedJob:
+            result = {
+                'status': 'ready',
+                'type': 'conversion',
+                'download_name': 'Test.mp3',
+            }
+
+            @staticmethod
+            def get_status(refresh):
+                return 'finished'
+
+        output = tmp_path / f'{self.job_id}.mp3'
+        output.write_bytes(b'mp3 data')
+        monkeypatch.setattr(app_module, 'DOWNLOAD_FOLDER', str(tmp_path))
+        monkeypatch.setattr(app_module, '_redis_connection', lambda: object())
+        monkeypatch.setattr(app_module, '_release_job_slot', lambda job_id: None)
+        monkeypatch.setattr(
+            app_module.Job, 'fetch', lambda *args, **kwargs: FinishedJob()
+        )
+
+        response = client.get(f'/downloads/{self.job_id}')
+
+        assert response.status_code == 200
+        assert response.data == b'mp3 data'
+        assert list(tmp_path.iterdir()) == []
+
+    def test_worker_revalidates_queued_url(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(app_module, 'DOWNLOAD_FOLDER', str(tmp_path))
+        monkeypatch.setattr(app_module, '_release_job_slot', lambda job_id: None)
+
+        result = app_module._conversion_job(
+            'https://example.com/not-youtube', self.job_id
+        )
+
+        assert result['status'] == 'failed'
+
+    def test_playlist_job_limits_track_count(self, monkeypatch):
+        class Playlist:
+            def __init__(self, options):
+                assert options['playlistend'] == 3
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def extract_info(self, url, download):
+                return {
+                    '_type': 'playlist',
+                    'entries': [{'id': str(index)} for index in range(3)],
+                }
+
+        monkeypatch.setattr(app_module, 'MAX_PLAYLIST_ITEMS', 2)
+        monkeypatch.setattr(app_module, 'is_safe_url', lambda url: True)
+        monkeypatch.setattr(app_module, '_release_job_slot', lambda job_id: None)
+        monkeypatch.setattr(app_module.yt_dlp, 'YoutubeDL', Playlist)
+
+        result = app_module._playlist_info_job(self.url, self.job_id)
+
+        assert result['status'] == 'failed'
+        assert '2 tracks' in result['error']
+
+
 class TestRateLimits:
-    def test_failed_expensive_requests_consume_quota(self):
+    def test_expensive_requests_consume_quota(self):
         subprocess.run([sys.executable, '-c', '''
-import yt_dlp
 import app as module
 
-class FailingDownload:
-    def __init__(self, options):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        pass
-
-    def extract_info(self, url, download):
-        raise yt_dlp.utils.DownloadError('unavailable')
-
 module.is_safe_url = lambda url: True
-module.yt_dlp.YoutubeDL = FailingDownload
+module._cleanup_stale_downloads = lambda: None
+module._enqueue_job = lambda function, url: '00000000-0000-0000-0000-000000000001'
 client = module.app.test_client()
 url = {'url': 'https://youtube.com/watch?v=dQw4w9WgXcQ'}
 
 assert [client.post('/convert', json=url).status_code for _ in range(6)] == [
-    422, 422, 422, 422, 422, 429,
+    202, 202, 202, 202, 202, 429,
 ]
 assert [client.post('/playlist/info', json=url).status_code for _ in range(11)] == [
-    422, 422, 422, 422, 422, 422, 422, 422, 422, 422, 429,
+    202, 202, 202, 202, 202, 202, 202, 202, 202, 202, 429,
 ]
 '''], env={**os.environ, 'TRUST_PROXY': '0', 'REDIS_URL': 'memory://'}, check=True)

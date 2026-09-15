@@ -31,7 +31,9 @@ an x86-64 Ubuntu server. ARM servers need a matching image build.
    Enter the token at the password prompt. Public packages do not require login.
 4. Install Nginx and copy this repository's `deploy/nginx.conf` to
    `/etc/nginx/sites-available/yt-convert`. Replace `convert.example.com` with
-   your domain, pointing its DNS record to this server.
+   your Cloudflare-proxied domain, pointing its DNS record to this server. The
+   config trusts `CF-Connecting-IP` only from Cloudflare's published address
+   ranges so Flask rate limits individual visitors instead of Cloudflare edges.
 
    ```sh
    sudo apt update
@@ -45,9 +47,10 @@ an x86-64 Ubuntu server. ARM servers need a matching image build.
    ```
 
    Allow SSH (port 22), HTTP (80), and HTTPS (443) in your server/cloud firewall.
-   Ports 3000 and 6379 should not be public. Nginx will return 502 until the first
-   successful deployment. The sample assumes Nginx receives clients directly;
-   a CDN or additional proxy needs its own trusted-client-IP configuration.
+   Ports 3000 and 6379 should not be public. Restrict ports 80 and 443 to
+   [Cloudflare's IP ranges](https://www.cloudflare.com/ips/) after certificate
+   setup so clients cannot bypass Cloudflare. Recheck those ranges when updating
+   Nginx. Nginx will return 502 until the first successful deployment.
 
 ## GitHub configuration
 
@@ -85,7 +88,7 @@ sudo certbot renew --dry-run
 ```sh
 cd /opt/yt-convert
 docker compose ps
-docker compose logs --tail=100 app redis
+docker compose logs --tail=100 app worker redis
 curl --fail http://127.0.0.1:3000/
 curl --fail https://convert.example.com/
 ```
@@ -103,13 +106,14 @@ printf 'APP_IMAGE=%s\n' "$APP_IMAGE" > .env
 
 Use lowercase owner/repository names. Deployments briefly interrupt service and
 can interrupt active conversions; failed health checks fail the workflow but do
-not automatically roll back. Downloads use a 512 MB temporary filesystem, and the
-app has a 1 GB memory limit and a 300-second worker timeout. Each conversion is
-limited to 100 MB of selected audio and 90 minutes; abandoned download files are
-removed after 10 minutes. Keep these limits aligned with `WEB_CONCURRENCY` and the
-downloads tmpfs size. Redis counters reset when Redis restarts. A healthy homepage
-verifies startup, not live YouTube access; test a conversion after deployment
-because datacenter IPs may be challenged.
+not automatically roll back. The web app returns queued jobs immediately; one RQ
+worker performs yt-dlp and ffmpeg work while the browser polls for completion.
+The shared downloads volume is a 512 MB temporary filesystem. At most 10 jobs are
+admitted, each conversion is limited to 100 MB and 90 minutes, playlists are
+limited to 50 tracks, and abandoned files expire after 10 minutes. Redis counters
+and queued jobs reset when Redis restarts. A healthy homepage verifies startup,
+not the worker's live YouTube access; test a conversion after deployment because
+datacenter IPs may be challenged.
 
 Client-IP handling follows Flask's [trusted proxy guidance](https://flask.palletsprojects.com/en/stable/deploying/proxy_fix/).
 Compose readiness uses [`up --wait`](https://docs.docker.com/reference/cli/docker/compose/up/).

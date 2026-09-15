@@ -45,16 +45,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify({ url })
             });
 
-            if (!infoResponse.ok) {
-                let errMsg = 'Failed to scan URL.';
-                try {
-                    const errData = await infoResponse.json();
-                    errMsg = errData.error || errMsg;
-                } catch {}
-                throw new Error(errMsg);
-            }
+            if (!infoResponse.ok) throw new Error(await responseError(infoResponse, 'Failed to scan URL.'));
 
-            const info = await infoResponse.json();
+            const info = await waitForJob(infoResponse);
 
             if (info.type === 'playlist') {
                 showPlaylistPreview(info, url);
@@ -78,21 +71,17 @@ document.addEventListener('DOMContentLoaded', () => {
         setBtnLoading();
 
         try {
-            const response = await fetch('/convert', {
+            const queuedResponse = await fetch('/convert', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ url })
             });
 
-            if (!response.ok) {
-                let errMsg = 'Failed to convert video.';
-                try {
-                    const errorData = await response.json();
-                    errMsg = errorData.error || errMsg;
-                } catch {}
-                throw new Error(errMsg);
-            }
+            if (!queuedResponse.ok) throw new Error(await responseError(queuedResponse, 'Failed to convert video.'));
 
+            const job = await waitForJob(queuedResponse);
+            const response = await fetch(job.download_url);
+            if (!response.ok) throw new Error(await responseError(response, 'Failed to download audio.'));
             await triggerDownload(response);
             showStatus('Download complete!', 'success');
             urlInput.value = '';
@@ -155,21 +144,17 @@ document.addEventListener('DOMContentLoaded', () => {
         hideStatus();
 
         try {
-            const response = await fetch('/convert', {
+            const queuedResponse = await fetch('/convert', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ url: videoUrl })
             });
 
-            if (!response.ok) {
-                let errMsg = 'Failed to convert video.';
-                try {
-                    const errorData = await response.json();
-                    errMsg = errorData.error || errMsg;
-                } catch {}
-                throw new Error(errMsg);
-            }
+            if (!queuedResponse.ok) throw new Error(await responseError(queuedResponse, 'Failed to convert video.'));
 
+            const job = await waitForJob(queuedResponse);
+            const response = await fetch(job.download_url);
+            if (!response.ok) throw new Error(await responseError(response, 'Failed to download audio.'));
             await triggerDownload(response);
 
             // Mark as downloaded
@@ -185,6 +170,32 @@ document.addEventListener('DOMContentLoaded', () => {
             showStatus(error.message, 'error');
         }
     });
+
+    async function responseError(response, fallback) {
+        try {
+            const data = await response.json();
+            return data.error || fallback;
+        } catch {
+            return fallback;
+        }
+    }
+
+    async function waitForJob(response) {
+        const queued = await response.json();
+        const maxAttempts = Math.ceil((queued.expires_in || 3600) / 2);
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            const statusResponse = await fetch(queued.status_url, { cache: 'no-store' });
+            if (statusResponse.status === 429) continue;
+            if (!statusResponse.ok) {
+                throw new Error(await responseError(statusResponse, 'Could not check conversion status.'));
+            }
+            const job = await statusResponse.json();
+            if (job.status === 'failed') throw new Error(job.error || 'Conversion failed.');
+            if (job.status === 'ready') return job;
+        }
+        throw new Error('Conversion timed out. Please try again.');
+    }
 
     // ── Utility: trigger file download from response ──────────────────
     function triggerDownload(response) {

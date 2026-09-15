@@ -9,19 +9,33 @@ import uuid
 from urllib.parse import urlparse
 
 import yt_dlp
-from flask import Flask, after_this_request, jsonify, render_template, request, send_file
+from flask import (
+    Flask,
+    after_this_request,
+    jsonify,
+    render_template,
+    request,
+    send_file,
+    url_for,
+)
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from redis import Redis
+from redis.exceptions import RedisError
+from rq import Queue
+from rq.exceptions import NoSuchJobError
+from rq.job import Job
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
 if os.environ.get('TRUST_PROXY') == '1':
     # Enable only behind the single Nginx proxy; keep port 3000 private.
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+REDIS_URL = os.environ.get('REDIS_URL')
 limiter = Limiter(
     key_func=get_remote_address,
     app=app,
-    storage_uri=os.environ.get('REDIS_URL', 'memory://'),
+    storage_uri=REDIS_URL or 'memory://',
 )
 
 # ── Security config ────────────────────────────────────────────────────────────
@@ -33,7 +47,27 @@ MAX_DOWNLOAD_BYTES = MAX_DOWNLOAD_MB * 1024 * 1024
 MAX_DURATION_MINUTES = int(os.environ.get('MAX_DURATION_MINUTES', '90'))
 MAX_DURATION_SECONDS = MAX_DURATION_MINUTES * 60
 STALE_DOWNLOAD_SECONDS = int(os.environ.get('STALE_DOWNLOAD_MINUTES', '10')) * 60
+MAX_PLAYLIST_ITEMS = int(os.environ.get('MAX_PLAYLIST_ITEMS', '50'))
+MAX_ACTIVE_JOBS = int(os.environ.get('MAX_ACTIVE_JOBS', '10'))
+JOB_TIMEOUT_SECONDS = int(os.environ.get('JOB_TIMEOUT_SECONDS', '300'))
+JOB_QUEUE_TTL_SECONDS = MAX_ACTIVE_JOBS * JOB_TIMEOUT_SECONDS
+JOB_RESULT_TTL_SECONDS = STALE_DOWNLOAD_SECONDS
+JOB_SLOT_SECONDS = (
+    JOB_QUEUE_TTL_SECONDS + JOB_TIMEOUT_SECONDS + JOB_RESULT_TTL_SECONDS
+)
+JOB_STATUS_RATE_LIMIT = f'{MAX_ACTIVE_JOBS * 36} per minute'
+JOB_SLOTS_KEY = 'yt-convert:active-jobs'
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+
+_RESERVE_JOB_SLOT = '''
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then
+    return 0
+end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
+redis.call('EXPIRE', KEYS[1], ARGV[5])
+return 1
+'''
 
 # ── Startup check: ffmpeg ──────────────────────────────────────────────────────
 if not shutil.which('ffmpeg'):
@@ -81,6 +115,58 @@ class MediaLimitError(Exception):
     """Raised when remote media exceeds this service's resource budget."""
 
 
+def _redis_connection():
+    if not REDIS_URL:
+        raise RedisError('REDIS_URL is required for conversion jobs')
+    return Redis.from_url(REDIS_URL)
+
+
+def _conversion_queue():
+    return Queue('conversions', connection=_redis_connection())
+
+
+def _reserve_job_slot(job_id):
+    now = int(time.time())
+    return bool(_redis_connection().eval(
+        _RESERVE_JOB_SLOT,
+        1,
+        JOB_SLOTS_KEY,
+        now,
+        MAX_ACTIVE_JOBS,
+        now + JOB_SLOT_SECONDS,
+        job_id,
+        JOB_SLOT_SECONDS,
+    ))
+
+
+def _release_job_slot(job_id):
+    try:
+        _redis_connection().zrem(JOB_SLOTS_KEY, str(job_id))
+    except RedisError as exc:
+        app.logger.error('Could not release job slot %s: %s', job_id, exc)
+
+
+def _enqueue_job(function, url):
+    job_id = str(uuid.uuid4())
+    if not _reserve_job_slot(job_id):
+        return None
+    try:
+        _conversion_queue().enqueue(
+            function,
+            url,
+            job_id,
+            job_id=job_id,
+            job_timeout=JOB_TIMEOUT_SECONDS,
+            ttl=JOB_QUEUE_TTL_SECONDS,
+            result_ttl=JOB_RESULT_TTL_SECONDS,
+            failure_ttl=JOB_RESULT_TTL_SECONDS,
+        )
+    except Exception:
+        _release_job_slot(job_id)
+        raise
+    return job_id
+
+
 def _enforce_media_limits(info, *, incomplete=False):
     if info.get('is_live') or info.get('live_status') in {'is_live', 'is_upcoming'}:
         raise MediaLimitError('Live streams cannot be converted.')
@@ -105,9 +191,13 @@ def _cleanup_job(job_id):
             app.logger.error('Error removing temp file %s: %s', path, exc)
 
 
+def _job_error(message):
+    return {'status': 'failed', 'error': message}
+
+
 def _cleanup_stale_downloads():
-    # ponytail: mtime cleanup assumes stuck workers die within Gunicorn's
-    # five-minute timeout; use a job queue if conversions may outlive it.
+    # ponytail: mtime cleanup is the fallback for killed workers; use durable
+    # object storage if completed downloads must survive container restarts.
     cutoff = time.time() - STALE_DOWNLOAD_SECONDS
     for entry in os.scandir(DOWNLOAD_FOLDER):
         try:
@@ -117,6 +207,7 @@ def _cleanup_stale_downloads():
                 and entry.stat().st_mtime < cutoff
             ):
                 os.remove(entry.path)
+                _release_job_slot(entry.name.split('.', 1)[0])
         except OSError as exc:
             app.logger.error('Error removing stale temp file %s: %s', entry.path, exc)
 
@@ -177,7 +268,7 @@ def friendly_error(exc: Exception) -> str:
         return 'Live streams cannot be converted. Try again after the stream ends.'
     if 'ffmpeg' in msg or 'ffprobe' in msg:
         return 'ffmpeg is not installed on the server. Please contact the administrator.'
-    return f'Conversion failed: {exc}'
+    return 'Conversion failed. Please try another video.'
 
 
 # ── Security headers ───────────────────────────────────────────────────────────
@@ -230,13 +321,151 @@ def _base_ydl_opts():
     return opts
 
 
+def _playlist_info_job(url, job_id):
+    try:
+        valid_url = is_valid_youtube_url(url) or is_playlist_url(url)
+        if not valid_url or not is_safe_url(url):
+            return _job_error('Please provide a valid YouTube URL.')
+
+        ydl_opts = _base_ydl_opts()
+        ydl_opts.update({
+            'extract_flat': True,
+            'noplaylist': False,
+            'playlistend': MAX_PLAYLIST_ITEMS + 1,
+        })
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if info is None:
+            return _job_error('Could not retrieve video information.')
+
+        if 'entries' in info and info.get('_type') != 'video':
+            entries = [entry for entry in info.get('entries') or [] if entry]
+            if len(entries) > MAX_PLAYLIST_ITEMS:
+                return _job_error(
+                    f'Playlists are limited to {MAX_PLAYLIST_ITEMS} tracks.'
+                )
+            tracks = [{
+                'video_id': entry['id'],
+                'title': entry.get('title', 'Unknown'),
+            } for entry in entries if entry.get('id')]
+            return {
+                'status': 'ready',
+                'type': 'playlist',
+                'title': info.get('title', 'Playlist'),
+                'track_count': len(tracks),
+                'tracks': tracks,
+            }
+
+        return {
+            'status': 'ready',
+            'type': 'video',
+            'title': info.get('title', 'Unknown'),
+            'video_id': info.get('id', ''),
+        }
+    except yt_dlp.utils.DownloadError as exc:
+        app.logger.error('yt-dlp DownloadError in playlist info job: %s', exc)
+        return _job_error(friendly_error(exc))
+    except Exception as exc:
+        app.logger.error('Unexpected error in playlist info job: %s', exc)
+        return _job_error('An unexpected error occurred.')
+    finally:
+        _release_job_slot(job_id)
+
+
+def _conversion_job(url, job_id):
+    output_template = os.path.join(DOWNLOAD_FOLDER, f'{job_id}.%(ext)s')
+    output_file = os.path.join(DOWNLOAD_FOLDER, f'{job_id}.mp3')
+    succeeded = False
+
+    try:
+        if not is_valid_youtube_url(url) or not is_safe_url(url):
+            return _job_error('Please provide a valid YouTube video URL.')
+
+        _cleanup_stale_downloads()
+        ydl_opts = _base_ydl_opts()
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'match_filter': _enforce_media_limits,
+            'max_filesize': MAX_DOWNLOAD_BYTES,
+            'outtmpl': output_template,
+            'progress_hooks': [_enforce_download_limit],
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'noplaylist': True,
+        })
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get('title', 'audio') if info else 'audio'
+
+        if (
+            not os.path.exists(output_file)
+            or os.path.getsize(output_file) > MAX_DOWNLOAD_BYTES
+        ):
+            return _job_error(
+                'The audio is unavailable or exceeds the '
+                f'{MAX_DOWNLOAD_MB} MB download limit.'
+            )
+
+        safe_title = re.sub(r'[^\w\s\-]', '', title, flags=re.UNICODE).strip()
+        succeeded = True
+        return {
+            'status': 'ready',
+            'type': 'conversion',
+            'download_name': f'{safe_title}.mp3' if safe_title else 'audio.mp3',
+        }
+    except MediaLimitError as exc:
+        return _job_error(str(exc))
+    except yt_dlp.utils.DownloadError as exc:
+        app.logger.error('yt-dlp DownloadError in conversion job: %s', exc)
+        return _job_error(friendly_error(exc))
+    except Exception as exc:
+        app.logger.error('Unexpected error during conversion job: %s', exc)
+        return _job_error('An unexpected error occurred. Please try again.')
+    finally:
+        if not succeeded:
+            _cleanup_job(job_id)
+            _release_job_slot(job_id)
+
+
+def _queued_response(function, url):
+    _cleanup_stale_downloads()
+    try:
+        job_id = _enqueue_job(function, url)
+    except (RedisError, OSError) as exc:
+        app.logger.error('Could not enqueue conversion job: %s', exc)
+        response = jsonify({'error': 'Conversion service is temporarily unavailable.'})
+        response.status_code = 503
+        response.headers['Retry-After'] = '10'
+        return response
+
+    if job_id is None:
+        response = jsonify({
+            'error': 'The conversion queue is full. Please try again shortly.'
+        })
+        response.status_code = 503
+        response.headers['Retry-After'] = '10'
+        return response
+
+    return jsonify({
+        'job_id': job_id,
+        'status': 'queued',
+        'status_url': url_for('job_status', job_id=job_id),
+        'expires_in': JOB_SLOT_SECONDS,
+    }), 202
+
+
 @app.route('/playlist/info', methods=['POST'])
 @limiter.limit('10 per minute')
 def playlist_info():
-    """Scan a YouTube URL and return playlist info if it's a playlist,
-    or single-video info if it's a regular video."""
+    """Queue a YouTube URL scan and return its status URL."""
     data = request.get_json(silent=True)
-    if not data or 'url' not in data:
+    if not isinstance(data, dict) or 'url' not in data:
         return jsonify({'error': 'URL is required'}), 400
 
     url = str(data['url']).strip()
@@ -247,55 +476,15 @@ def playlist_info():
     if not is_safe_url(url):
         return jsonify({'error': 'Please provide a valid YouTube URL.'}), 400
 
-    # Build options to extract flat playlist info (no download)
-    ydl_opts = _base_ydl_opts()
-    ydl_opts['extract_flat'] = True
-    ydl_opts['noplaylist'] = False
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        if info is None:
-            return jsonify({'error': 'Could not retrieve video information.'}), 422
-
-        # Check if it's a playlist
-        if 'entries' in info and info.get('_type') != 'video':
-            entries = info.get('entries') or []
-            tracks = []
-            for entry in entries:
-                if entry and entry.get('id'):
-                    tracks.append({
-                        'video_id': entry['id'],
-                        'title': entry.get('title', 'Unknown'),
-                    })
-            return jsonify({
-                'type': 'playlist',
-                'title': info.get('title', 'Playlist'),
-                'track_count': len(tracks),
-                'tracks': tracks,
-            })
-        else:
-            return jsonify({
-                'type': 'video',
-                'title': info.get('title', 'Unknown'),
-                'video_id': info.get('id', ''),
-            })
-
-    except yt_dlp.utils.DownloadError as exc:
-        app.logger.error('yt-dlp DownloadError in playlist_info: %s', exc)
-        return jsonify({'error': friendly_error(exc)}), 422
-    except Exception as exc:
-        app.logger.error('Unexpected error in playlist_info: %s', exc)
-        return jsonify({'error': 'An unexpected error occurred.'}), 500
+    return _queued_response(_playlist_info_job, url)
 
 
 @app.route('/convert', methods=['POST'])
 @limiter.limit('5 per minute')
 def convert():
-    """Download a single YouTube video as MP3."""
+    """Queue a single YouTube video for MP3 conversion."""
     data = request.get_json(silent=True)
-    if not data or 'url' not in data:
+    if not isinstance(data, dict) or 'url' not in data:
         return jsonify({'error': 'URL is required'}), 400
 
     url = str(data['url']).strip()
@@ -308,64 +497,64 @@ def convert():
     if not is_safe_url(url):
         return jsonify({'error': 'Please provide a valid YouTube URL.'}), 400
 
-    _cleanup_stale_downloads()
-    job_id = str(uuid.uuid4())
-    output_template = os.path.join(DOWNLOAD_FOLDER, f'{job_id}.%(ext)s')
+    return _queued_response(_conversion_job, url)
+
+
+@app.route('/jobs/<uuid:job_id>')
+@limiter.limit(JOB_STATUS_RATE_LIMIT)
+def job_status(job_id):
+    try:
+        job = Job.fetch(str(job_id), connection=_redis_connection())
+        status = job.get_status(refresh=True)
+    except NoSuchJobError:
+        return jsonify({'error': 'Conversion job not found.'}), 404
+    except RedisError as exc:
+        app.logger.error('Could not read conversion job: %s', exc)
+        return jsonify({'error': 'Conversion service is temporarily unavailable.'}), 503
+
+    if status == 'finished':
+        result = dict(job.result or _job_error('Conversion failed.'))
+        if result.get('type') == 'conversion' and result.get('status') == 'ready':
+            result['download_url'] = url_for('download_job', job_id=job_id)
+        return jsonify(result)
+    if status in {'failed', 'stopped', 'canceled'}:
+        return jsonify(_job_error('Conversion failed. Please try again.'))
+    return jsonify({'status': 'running' if status == 'started' else 'queued'})
+
+
+@app.route('/downloads/<uuid:job_id>')
+@limiter.limit('10 per minute')
+def download_job(job_id):
+    job_id = str(job_id)
+    try:
+        job = Job.fetch(job_id, connection=_redis_connection())
+        status = job.get_status(refresh=True)
+    except NoSuchJobError:
+        return jsonify({'error': 'Conversion job not found.'}), 404
+    except RedisError as exc:
+        app.logger.error('Could not read conversion job: %s', exc)
+        return jsonify({'error': 'Conversion service is temporarily unavailable.'}), 503
+
+    result = job.result or {}
     output_file = os.path.join(DOWNLOAD_FOLDER, f'{job_id}.mp3')
+    if status != 'finished' or result.get('type') != 'conversion':
+        return jsonify({'error': 'Conversion is not ready.'}), 409
+    if not os.path.exists(output_file):
+        _release_job_slot(job_id)
+        return jsonify({'error': 'The download has expired.'}), 410
 
     @after_this_request
     def remove_files(response):
         _cleanup_job(job_id)
+        _release_job_slot(job_id)
         return response
 
-    ydl_opts = _base_ydl_opts()
-    ydl_opts.update({
-        'format': 'bestaudio/best',
-        'match_filter': _enforce_media_limits,
-        'max_filesize': MAX_DOWNLOAD_BYTES,
-        'outtmpl': output_template,
-        'progress_hooks': [_enforce_download_limit],
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'noplaylist': True,
-    })
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            title = info.get('title', 'audio') if info else 'audio'
-
-        if not os.path.exists(output_file):
-            return jsonify({
-                'error': (
-                    'The audio is unavailable or exceeds the '
-                    f'{MAX_DOWNLOAD_MB} MB download limit.'
-                )
-            }), 422
-
-        safe_title = re.sub(r'[^\w\s\-]', '', title, flags=re.UNICODE).strip()
-        download_name = f'{safe_title}.mp3' if safe_title else 'audio.mp3'
-
-        return send_file(
-            output_file,
-            as_attachment=True,
-            download_name=download_name,
-            mimetype='audio/mpeg',
-        )
-
-    except MediaLimitError as exc:
-        return jsonify({'error': str(exc)}), 422
-
-    except yt_dlp.utils.DownloadError as exc:
-        app.logger.error('yt-dlp DownloadError: %s', exc)
-        return jsonify({'error': friendly_error(exc)}), 422
-
-    except Exception as exc:
-        app.logger.error('Unexpected error during conversion: %s', exc)
-        return jsonify({'error': 'An unexpected error occurred. Please try again.'}), 500
+    return send_file(
+        output_file,
+        as_attachment=True,
+        download_name=result.get('download_name', 'audio.mp3'),
+        mimetype='audio/mpeg',
+    )
 
 
 # ── Payload too large handler ──────────────────────────────────────────────────

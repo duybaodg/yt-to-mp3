@@ -10,20 +10,45 @@ services:
       WEB_CONCURRENCY: 2
       MAX_DOWNLOAD_MB: 100
       MAX_DURATION_MINUTES: 90
+      MAX_PLAYLIST_ITEMS: 50
+      MAX_ACTIVE_JOBS: 10
+      STALE_DOWNLOAD_MINUTES: 10
+    depends_on:
+      redis:
+        condition: service_healthy
+    cpus: 1
+    mem_limit: 384m
+    pids_limit: 100
+    volumes:
+      - downloads:/app/downloads
+    restart: unless-stopped
+
+  worker:
+    image: ${APP_IMAGE:-yt-convert:local}
+    build: .
+    command: rq worker --url redis://redis:6379/0 conversions
+    healthcheck:
+      disable: true
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      MAX_DOWNLOAD_MB: 100
+      MAX_DURATION_MINUTES: 90
+      MAX_PLAYLIST_ITEMS: 50
+      MAX_ACTIVE_JOBS: 10
       STALE_DOWNLOAD_MINUTES: 10
     depends_on:
       redis:
         condition: service_healthy
     cpus: 2
-    mem_limit: 1g
+    mem_limit: 768m
     pids_limit: 100
-    tmpfs:
-      - /app/downloads:size=512m,uid=1000,gid=1000
+    volumes:
+      - downloads:/app/downloads
     restart: unless-stopped
 
   redis:
     image: redis:7.4-alpine
-    command: redis-server --save '' --appendonly no --maxmemory 64mb --maxmemory-policy allkeys-lru
+    command: redis-server --save '' --appendonly no --maxmemory 64mb --maxmemory-policy noeviction
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 5s
@@ -31,3 +56,10 @@ services:
       retries: 5
     mem_limit: 96m
     restart: unless-stopped
+
+volumes:
+  downloads:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=512m,uid=1000,gid=1000
